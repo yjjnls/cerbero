@@ -1,0 +1,267 @@
+From e646fef14cfa9181149843a02dc0344615d658ac Mon Sep 17 00:00:00 2001
+From: yuanjunjie <yuanjunjie@kedacom.com>
+Date: Wed, 6 Jun 2018 09:27:49 +0800
+Subject: [PATCH] add property to set sync false and close session
+
+---
+ gst/rtsp-server/rtsp-client.c | 73 ++++++++++++++++++++++++++++++++++++++++---
+ gst/rtsp-server/rtsp-stream.c | 39 ++++++++++++++++++++---
+ 2 files changed, 104 insertions(+), 8 deletions(-)
+
+diff --git a/gst/rtsp-server/rtsp-client.c b/gst/rtsp-server/rtsp-client.c
+index 9df4c9b..f8c948c 100644
+--- a/gst/rtsp-server/rtsp-client.c
++++ b/gst/rtsp-server/rtsp-client.c
+@@ -110,6 +110,7 @@ static GHashTable *tunnels;     /* protected by tunnels_lock */
+ #define DEFAULT_SESSION_POOL            NULL
+ #define DEFAULT_MOUNT_POINTS            NULL
+ #define DEFAULT_DROP_BACKLOG            TRUE
++#define DEFAULT_PATH                    NULL
+ 
+ #define RTSP_CTRL_CB_INTERVAL           1
+ #define RTSP_CTRL_TIMEOUT_VALUE         60
+@@ -120,6 +121,8 @@ enum
+   PROP_SESSION_POOL,
+   PROP_MOUNT_POINTS,
+   PROP_DROP_BACKLOG,
++  PROP_PATH,
++  PROP_CLOSE,
+   PROP_LAST
+ };
+ 
+@@ -235,6 +238,16 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
+           "Drop data when the backlog queue is full",
+           DEFAULT_DROP_BACKLOG, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
++  g_object_class_install_property (gobject_class, PROP_PATH,
++      g_param_spec_string ("path", "Path",
++          "Path rtsp client connect to",
++          DEFAULT_PATH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
++  g_object_class_install_property (gobject_class, PROP_CLOSE,
++      g_param_spec_object ("close", "Close",
++          "Close rtsp session actively",
++          GST_TYPE_RTSP_SESSION, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
+   gst_rtsp_client_signals[SIGNAL_CLOSED] =
+       g_signal_new ("closed", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
+       G_STRUCT_OFFSET (GstRTSPClientClass, closed), NULL, NULL,
+@@ -738,11 +751,15 @@ gst_rtsp_client_finalize (GObject * obj)
+     gst_rtsp_watch_set_flushing (priv->watch, TRUE);
+   gst_rtsp_client_set_send_func (client, NULL, NULL, NULL);
+ 
+-  if (priv->watch)
++  if (priv->watch) {
+     g_source_destroy ((GSource *) priv->watch);
++    priv->watch = NULL;
++  }
+ 
+-  if (priv->watch_context)
++  if (priv->watch_context) {
+     g_main_context_unref (priv->watch_context);
++    priv->watch_context = NULL;
++  }
+ 
+   /* all sessions should have been removed by now. We keep a ref to
+    * the client object for the session removed handler. The ref is
+@@ -792,6 +809,11 @@ gst_rtsp_client_get_property (GObject * object, guint propid,
+     case PROP_DROP_BACKLOG:
+       g_value_set_boolean (value, priv->drop_backlog);
+       break;
++    case PROP_PATH: {
++      gchar *result = g_strdup_printf ("%s", priv->path);
++      g_value_take_string (value, result);
++    }
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, propid, pspec);
+   }
+@@ -816,6 +838,12 @@ gst_rtsp_client_set_property (GObject * object, guint propid,
+       priv->drop_backlog = g_value_get_boolean (value);
+       g_mutex_unlock (&priv->lock);
+       break;
++    case PROP_PATH:
++      priv->path = g_strdup_printf ("%s" , g_value_get_string (value));
++      break;
++    case PROP_CLOSE:
++      gst_rtsp_client_teardown_actively (client, priv->path, g_value_get_object (value));
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, propid, pspec);
+   }
+@@ -1115,8 +1143,10 @@ gst_rtsp_client_close (GstRTSPClient * client)
+     g_source_destroy ((GSource *) priv->watch);
+     priv->watch = NULL;
+     gst_rtsp_client_set_send_func (client, NULL, NULL, NULL);
+-    g_main_context_unref (priv->watch_context);
+-    priv->watch_context = NULL;
++    if (priv->watch_context) {
++        g_main_context_unref (priv->watch_context);
++        priv->watch_context = NULL;
++    }
+   }
+ }
+ 
+@@ -4265,6 +4295,41 @@ gst_rtsp_client_send_message (GstRTSPClient * client, GstRTSPSession * session,
+   return GST_RTSP_OK;
+ }
+ 
++
++// static char * 
++// client_get_path (GstRTSPClient *client)
++// {
++//     GstRTSPClientPrivate *priv = client->priv;
++//     gchar *result;
++//     result = g_strdup_printf ("%s", priv->path);
++//     return result;
++// }
++
++gboolean
++gst_rtsp_client_teardown_actively (GstRTSPClient *client, gchar *path, GstRTSPSession *session)
++{
++    GstRTSPClientPrivate *priv = client->priv;
++    // GstRTSPSession *session = gst_rtsp_session_pool_find (priv->session_pool, sessid);
++    // if (!session)
++    //     return FALSE;
++    // client_watch_session (client, session);
++
++    gint matched;
++    GstRTSPSessionMedia *sessmedia = gst_rtsp_session_get_media (session, path, &matched);
++    if (sessmedia) {
++        gst_rtsp_session_media_set_state (sessmedia, GST_STATE_NULL);
++        gboolean keep_session = gst_rtsp_session_release_media (session, sessmedia);
++        if (!keep_session) {
++            /* remove the session */
++            gst_rtsp_session_pool_remove (priv->session_pool, session);
++        }
++        gst_rtsp_client_close (client);
++        GST_FIXME ("rtsp-client close the connection actively!");
++        return TRUE;
++    }
++    return FALSE;
++}
++
+ static gboolean
+ do_send_message (GstRTSPClient * client, GstRTSPMessage * message,
+     gboolean close, gpointer user_data)
+diff --git a/gst/rtsp-server/rtsp-stream.c b/gst/rtsp-server/rtsp-stream.c
+index 45b6238..459f1b2 100644
+--- a/gst/rtsp-server/rtsp-stream.c
++++ b/gst/rtsp-server/rtsp-stream.c
+@@ -76,6 +76,7 @@ struct _GstRTSPStreamPrivate
+    * the client side of an RTSP link (for RECORD) */
+   gboolean client_side;
+   gchar *control;
++  gboolean sink_false;
+ 
+   /* TRUE if stream is complete. This means that the receiver and the sender
+    * parts are present in the stream. */
+@@ -172,6 +173,8 @@ struct _GstRTSPStreamPrivate
+ #define DEFAULT_PROFILES        GST_RTSP_PROFILE_AVP
+ #define DEFAULT_PROTOCOLS       GST_RTSP_LOWER_TRANS_UDP | GST_RTSP_LOWER_TRANS_UDP_MCAST | \
+                                         GST_RTSP_LOWER_TRANS_TCP
++#define DEFAULT_SINK_FALSE      FALSE
++
+ 
+ enum
+ {
+@@ -179,6 +182,7 @@ enum
+   PROP_CONTROL,
+   PROP_PROFILES,
+   PROP_PROTOCOLS,
++  PROP_SINK_FALSE,
+   PROP_LAST
+ };
+ 
+@@ -223,6 +227,11 @@ gst_rtsp_stream_class_init (GstRTSPStreamClass * klass)
+           "The control string for this stream", DEFAULT_CONTROL,
+           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
++  g_object_class_install_property (gobject_class, PROP_SINK_FALSE,
++      g_param_spec_boolean ("sink-false", "Sink False",
++          "set udpsink to false", DEFAULT_SINK_FALSE,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
+   g_object_class_install_property (gobject_class, PROP_PROFILES,
+       g_param_spec_flags ("profiles", "Profiles",
+           "Allowed transfer profiles", GST_TYPE_RTSP_PROFILE,
+@@ -262,6 +271,7 @@ gst_rtsp_stream_init (GstRTSPStream * stream)
+   priv->profiles = DEFAULT_PROFILES;
+   priv->protocols = DEFAULT_PROTOCOLS;
+   priv->publish_clock_mode = GST_RTSP_PUBLISH_CLOCK_MODE_CLOCK;
++  priv->sink_false = DEFAULT_SINK_FALSE;
+ 
+   g_mutex_init (&priv->lock);
+ 
+@@ -331,11 +341,15 @@ gst_rtsp_stream_get_property (GObject * object, guint propid,
+     GValue * value, GParamSpec * pspec)
+ {
+   GstRTSPStream *stream = GST_RTSP_STREAM (object);
++  GstRTSPStreamPrivate *priv = stream->priv;
+ 
+   switch (propid) {
+     case PROP_CONTROL:
+       g_value_take_string (value, gst_rtsp_stream_get_control (stream));
+       break;
++    case PROP_SINK_FALSE:
++      g_value_set_boolean (value, priv->sink_false);
++      break;
+     case PROP_PROFILES:
+       g_value_set_flags (value, gst_rtsp_stream_get_profiles (stream));
+       break;
+@@ -352,11 +366,17 @@ gst_rtsp_stream_set_property (GObject * object, guint propid,
+     const GValue * value, GParamSpec * pspec)
+ {
+   GstRTSPStream *stream = GST_RTSP_STREAM (object);
++  GstRTSPStreamPrivate *priv = stream->priv;
+ 
+   switch (propid) {
+     case PROP_CONTROL:
+       gst_rtsp_stream_set_control (stream, g_value_get_string (value));
+       break;
++    case PROP_SINK_FALSE:
++      g_mutex_lock (&priv->lock);
++      priv->sink_false = g_value_get_boolean (value);
++      g_mutex_unlock (&priv->lock);
++      break;
+     case PROP_PROFILES:
+       gst_rtsp_stream_set_profiles (stream, g_value_get_flags (value));
+       break;
+@@ -1187,10 +1207,17 @@ create_and_configure_udpsink (GstRTSPStream * stream, GstElement ** udpsink,
+ 
+   g_object_set (G_OBJECT (*udpsink), "send-duplicates", FALSE, NULL);
+ 
+-  if (is_rtp)
+-    g_object_set (G_OBJECT (*udpsink), "buffer-size", priv->buffer_size, NULL);
+-  else
++  if (!priv->sink_false) {
++    if (is_rtp)
++        g_object_set (G_OBJECT (*udpsink), "buffer-size", priv->buffer_size, NULL);
++    else
++        g_object_set (G_OBJECT (*udpsink), "sync", FALSE, NULL);
++  } else {
++    if (is_rtp)
++        g_object_set (G_OBJECT (*udpsink), "buffer-size", priv->buffer_size, NULL);
+     g_object_set (G_OBJECT (*udpsink), "sync", FALSE, NULL);
++    GST_INFO("sink false is set!");
++  }
+ 
+   /* Needs to be async for RECORD streams, otherwise we will never go to
+    * PLAYING because the sinks will wait for data while the udpsrc can't
+@@ -2858,8 +2885,12 @@ create_sender_part (GstRTSPStream * stream, const GstRTSPTransport * transport)
+ 
+       /* we need to set sync and preroll to FALSE for the sink to avoid
+        * deadlock. This is only needed for sink sending RTCP data. */
+-      if (i == 1)
++      if (!priv->sink_false) {
++        if (i == 1)
++            g_object_set (priv->appsink[i], "async", FALSE, "sync", FALSE, NULL);
++      } else {
+         g_object_set (priv->appsink[i], "async", FALSE, "sync", FALSE, NULL);
++      }
+ 
+       gst_app_sink_set_callbacks (GST_APP_SINK_CAST (priv->appsink[i]),
+           &sink_cb, stream, NULL);
+-- 
+2.13.0.windows.1
+

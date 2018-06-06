@@ -14,6 +14,7 @@ class Recipe(custom.GStreamer):
     files_plugins_net_devel = [
         'lib/gstreamer-1.0/libgstrtspclientsink.a', 'lib/gstreamer-1.0/libgstrtspclientsink.la',
     ]
+    patches = ['gst-rtsp-server/0001-add-property-to-set-sync-false-and-close-session.patch']
 
     def prepare(self):
         self.append_env['CFLAGS'] = " -Wno-error "
